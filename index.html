@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hostlinku Live USD Cost Calculator</title>
+  <style>
+    :root { --bg: #0b0d12; --card: #131722; --border: #232a3b; --text: #eef1f7; --muted: #98a2b3; --accent: #3b82f6; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 24px; line-height: 1.5; }
+    main { max-width: 1120px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; margin: 0 0 6px; }
+    p.sub { color: var(--muted); margin: 0 0 20px; font-size: 0.95rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 0.82rem; color: var(--muted); }
+    input, select, textarea, button { font: inherit; background: #0d1119; color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; }
+    button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; font-weight: 500; }
+    button.secondary { background: transparent; border-color: var(--border); color: var(--text); }
+    .status { font-size: 0.88rem; margin-bottom: 14px; padding: 10px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--card); }
+    .fallback { display: none; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 16px; }
+    .fallback.visible { display: block; }
+    textarea { width: 100%; min-height: 90px; margin: 8px 0; font-family: ui-monospace, monospace; font-size: 0.82rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--card); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 600; background: #10141e; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    code { background: #181e2c; padding: 2px 5px; border-radius: 3px; font-size: 0.84rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Hostlinku Live USD Cost Calculator</h1>
+    <p class="sub">Fetches live per-million-token USD pricing from <code>https://api.hostlinku.com/api/public/models</code>. Zero hardcoded prices.</p>
+
+    <div class="grid">
+      <label>Service Mode
+        <select id="mode">
+          <option value="all">All Modes</option>
+          <option value="performance">Performance</option>
+          <option value="economy">Economy</option>
+          <option value="dedicated">Dedicated</option>
+        </select>
+      </label>
+      <label>Search Model / Vendor
+        <input id="search" type="text" placeholder="e.g. claude, gpt, deepseek">
+      </label>
+      <label>Uncached Input Tokens
+        <input id="inputTokens" type="number" min="0" value="10000">
+      </label>
+      <label>Output Tokens
+        <input id="outputTokens" type="number" min="0" value="1000">
+      </label>
+      <label>Cache Read Tokens
+        <input id="cacheRead" type="number" min="0" value="0">
+      </label>
+      <label>Cache Write (5m) Tokens
+        <input id="cacheWrite" type="number" min="0" value="0">
+      </label>
+      <label>Requests
+        <input id="requests" type="number" min="1" value="1">
+      </label>
+    </div>
+
+    <div id="status" class="status">Loading live catalog from <code>api.hostlinku.com</code>…</div>
+
+    <div id="fallback" class="fallback">
+      <div><strong>Browser CORS blocked direct fetch</strong> or <code>./models.json</code> was not found. Run <code>node cli/calc.mjs --export models.json</code> in a local server, choose the exported file below, or paste the JSON from <code>curl -s "https://api.hostlinku.com/api/public/models?limit=100"</code>:</div>
+      <div style="display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap;">
+        <input id="fileInput" type="file" accept=".json,application/json">
+        <button id="loadPasteBtn" type="button">Load pasted JSON</button>
+      </div>
+      <textarea id="pasteBox" placeholder='Paste JSON response from https://api.hostlinku.com/api/public/models?limit=100 here...'></textarea>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Vendor</th>
+            <th>Mode</th>
+            <th class="num">In / 1M</th>
+            <th class="num">Out / 1M</th>
+            <th class="num">Cache Read / 1M</th>
+            <th class="num">Per Request (USD)</th>
+            <th class="num">Total (USD)</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </main>
+
+  <script>
+    const LIVE_URL = "https://api.hostlinku.com/api/public/models?limit=100";
+    let catalog = null;
+
+    function fmtUsd(v) {
+      if (v == null || Number.isNaN(v)) return "-";
+      if (v === 0) return "$0.00";
+      return v < 0.01 ? `$${v.toFixed(6)}` : `$${v.toFixed(4)}`;
+    }
+
+    function selectRates(modeData, totalPromptTokens) {
+      const base = modeData && modeData.prices;
+      if (!base) return null;
+      const out = {
+        input: base.inputCredits ?? null,
+        output: base.outputCredits ?? null,
+        cacheRead: base.cacheReadCredits ?? null,
+        cacheWrite5m: base.cacheWrite5mCredits ?? null,
+      };
+      const tiers = [...(modeData.tiers || [])].sort((a, b) => (a.minTokens || 0) - (b.minTokens || 0));
+      for (const t of tiers) {
+        if (totalPromptTokens < (t.minTokens || 0)) break;
+        if (t.inputCredits != null) out.input = t.inputCredits;
+        if (t.outputCredits != null) out.output = t.outputCredits;
+        if (t.cacheReadCredits != null) out.cacheRead = t.cacheReadCredits;
+        if (t.cacheWrite5mCredits != null) out.cacheWrite5m = t.cacheWrite5mCredits;
+      }
+      return out;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function render() {
+      const tbody = document.getElementById("tbody");
+      if (!catalog || !Array.isArray(catalog.models)) { tbody.innerHTML = ""; return; }
+      const modeFilter = document.getElementById("mode").value;
+      const q = document.getElementById("search").value.trim().toLowerCase();
+      const inTok = Math.max(0, Number(document.getElementById("inputTokens").value) || 0);
+      const outTok = Math.max(0, Number(document.getElementById("outputTokens").value) || 0);
+      const crTok = Math.max(0, Number(document.getElementById("cacheRead").value) || 0);
+      const cwTok = Math.max(0, Number(document.getElementById("cacheWrite").value) || 0);
+      const reqs = Math.max(1, Number(document.getElementById("requests").value) || 1);
+      const totalPrompt = inTok + crTok + cwTok;
+      const modes = modeFilter === "all" ? ["performance", "economy", "dedicated"] : [modeFilter];
+
+      const rows = [];
+      for (const m of catalog.models) {
+        if (q && !m.slug.toLowerCase().includes(q) && !String(m.vendor || "").toLowerCase().includes(q)) continue;
+        for (const mode of modes) {
+          const md = m.modes && m.modes[mode];
+          const rates = selectRates(md, totalPrompt);
+          if (!rates || rates.input == null || rates.output == null) continue;
+          const perReq = (inTok / 1e6) * rates.input + (outTok / 1e6) * rates.output +
+            (rates.cacheRead != null ? (crTok / 1e6) * rates.cacheRead : 0) +
+            (rates.cacheWrite5m != null ? (cwTok / 1e6) * rates.cacheWrite5m : 0);
+          rows.push({ slug: m.slug, vendor: m.vendor || "-", mode, rates, perReq, total: perReq * reqs });
+        }
+      }
+      rows.sort((a, b) => a.total - b.total);
+      tbody.innerHTML = rows.map((r) => `<tr>
+        <td><code>${esc(r.slug)}</code></td>
+        <td>${esc(r.vendor)}</td>
+        <td>${esc(r.mode)}</td>
+        <td class="num">${fmtUsd(r.rates.input)}</td>
+        <td class="num">${fmtUsd(r.rates.output)}</td>
+        <td class="num">${fmtUsd(r.rates.cacheRead)}</td>
+        <td class="num">${fmtUsd(r.perReq)}</td>
+        <td class="num"><strong>${fmtUsd(r.total)}</strong></td>
+      </tr>`).join("");
+    }
+
+    async function loadCatalog() {
+      const status = document.getElementById("status");
+      const fallback = document.getElementById("fallback");
+      for (const [label, url] of [["live API", LIVE_URL], ["local ./models.json", "./models.json"]]) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (Array.isArray(data.models)) {
+            catalog = data;
+            status.textContent = `Loaded ${data.models.length} models (${data.currency || "USD"}) from ${label}.`;
+            fallback.classList.remove("visible");
+            render();
+            return;
+          }
+        } catch {}
+      }
+      status.textContent = "Could not load catalog directly from this origin. Load exported JSON below or use `node cli/calc.mjs`.";
+      fallback.classList.add("visible");
+    }
+
+    for (const id of ["mode", "search", "inputTokens", "outputTokens", "cacheRead", "cacheWrite", "requests"]) {
+      document.getElementById(id).addEventListener("input", render);
+    }
+    document.getElementById("fileInput").addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      catalog = JSON.parse(await file.text());
+      document.getElementById("status").textContent = `Loaded ${catalog.models?.length ?? 0} models from ${file.name}.`;
+      render();
+    });
+    document.getElementById("loadPasteBtn").addEventListener("click", () => {
+      catalog = JSON.parse(document.getElementById("pasteBox").value);
+      document.getElementById("status").textContent = `Loaded ${catalog.models?.length ?? 0} models from pasted JSON.`;
+      render();
+    });
+    loadCatalog();
+  </script>
+</body>
+</html>
