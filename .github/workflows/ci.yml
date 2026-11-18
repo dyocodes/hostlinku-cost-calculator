@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check CLI syntax
+        run: |
+          node --check cli/calc.mjs
+          node cli/calc.mjs --help > /dev/null
+      - name: Check index.html structure
+        run: |
+          node -e '
+            const fs = require("fs");
+            const html = fs.readFileSync("index.html", "utf8");
+            if (!html.includes("<!DOCTYPE html>") || !html.includes("https://api.hostlinku.com/api/public/models")) {
+              process.exit(1);
+            }
+            console.log("index.html OK");
+          '
